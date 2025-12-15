@@ -1,3 +1,6 @@
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using PacketGenerator;
 using Protodef.Enumerable;
 
@@ -8,6 +11,14 @@ namespace Protodef;
 /// </summary>
 public static class ProtodefDiff
 {
+    /// <summary>
+    /// Default JSON serialization options for diff nodes.
+    /// </summary>
+    public static readonly JsonSerializerOptions DefaultJsonOptions = new(ProtodefType.DefaultJsonOptions)
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
     /// <summary>
     /// Builds a diff tree from multiple versions of the same structure.
     /// </summary>
@@ -41,6 +52,49 @@ public static class ProtodefDiff
         return root;
     }
 
+    /// <summary>
+    /// Serializes a diff node and its children to a JSON string.
+    /// </summary>
+    /// <param name="root">Root node returned from <see cref="DiffTypes"/>.</param>
+    /// <param name="options">Optional JSON options; defaults to <see cref="DefaultJsonOptions"/>.</param>
+    /// <returns>A JSON representation of the diff tree.</returns>
+    /// <remarks>
+    /// <para>
+    /// The output aligns every node by version with <c>versions</c> and <c>structures</c> arrays, allowing consumers to
+    /// see additions or removals explicitly. Null entries in <c>structures</c> indicate a missing type for that version.
+    /// </para>
+    /// <para>Example: serializing a packet diff that exists only in versions 757 and 759:</para>
+    /// <code>
+    /// var json = ProtodefDiff.ToJson(ProtodefDiff.DiffTypes([
+    ///     new TypeFinderResult(757, packet757),
+    ///     new TypeFinderResult(758),
+    ///     new TypeFinderResult(759, packet759)
+    /// ]));
+    /// </code>
+    /// </remarks>
+    public static string ToJson(ProtodefDiffNode root, JsonSerializerOptions? options = null)
+    {
+        using var stream = new MemoryStream();
+        using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = options?.WriteIndented ?? true });
+        WriteJson(root, writer, options);
+        writer.Flush();
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    /// <summary>
+    /// Writes a diff node and its children to an existing JSON writer.
+    /// </summary>
+    /// <param name="root">Root node returned from <see cref="DiffTypes"/>.</param>
+    /// <param name="writer">Destination writer.</param>
+    /// <param name="options">Optional JSON options; defaults to <see cref="DefaultJsonOptions"/>.</param>
+    public static void WriteJson(ProtodefDiffNode root, Utf8JsonWriter writer, JsonSerializerOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(root);
+        ArgumentNullException.ThrowIfNull(writer);
+
+        WriteNode(root, writer, options ?? DefaultJsonOptions);
+    }
+
     private static void BuildRecursive(ProtodefDiffNode node)
     {
         foreach (var child in ProtodefSemanticChildrenBuilder.Build(node.Versions, node.Structures))
@@ -48,6 +102,35 @@ public static class ProtodefDiff
             node.Children.Add(child);
             BuildRecursive(child);
         }
+    }
+
+    private static void WriteNode(ProtodefDiffNode node, Utf8JsonWriter writer, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+
+        if (node.Key is not null)
+            writer.WriteString("key", node.Key);
+
+        writer.WritePropertyName("versions");
+        JsonSerializer.Serialize(writer, node.Versions, options);
+
+        writer.WritePropertyName("structures");
+        JsonSerializer.Serialize(writer, node.Structures, options);
+
+        if (node.Children.Count > 0)
+        {
+            writer.WritePropertyName("children");
+            writer.WriteStartArray();
+
+            foreach (var child in node.Children)
+            {
+                WriteNode(child, writer, options);
+            }
+
+            writer.WriteEndArray();
+        }
+
+        writer.WriteEndObject();
     }
 }
 
