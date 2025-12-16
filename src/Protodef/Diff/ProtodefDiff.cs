@@ -1,478 +1,264 @@
-using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-using PacketGenerator;
 using Protodef.Enumerable;
 
 namespace Protodef;
 
 /// <summary>
-/// Provides utilities for building semantic difference trees between <see cref="ProtodefType"/> graphs.
+/// Computes semantic diffs between two protodef AST nodes using protocol-aware rules
+/// instead of structural JSON comparisons.
 /// </summary>
 public static class ProtodefDiff
 {
     /// <summary>
-    /// Default JSON serialization options for diff nodes.
+    /// Builds a list of semantic changes between two versions of the same protodef structure.
     /// </summary>
-    public static readonly JsonSerializerOptions DefaultJsonOptions = new(ProtodefType.DefaultJsonOptions)
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
-
-    /// <summary>
-    /// Default options that control how diff nodes are written to JSON.
-    /// </summary>
-    public static readonly ProtodefDiffJsonOptions DefaultDiffJsonOptions = new();
-
-    /// <summary>
-    /// Builds a diff tree from multiple versions of the same structure.
-    /// </summary>
-    /// <param name="inputs">Versioned results describing the structure in each protocol.</param>
-    /// <remarks>
-    /// The inputs are ordered by <see cref="TypeFinderResult.Version"/>, and null structures are allowed when a
-    /// version does not provide the type. The resulting <see cref="ProtodefDiffNode"/> can be traversed to compare
-    /// children across versions.
-    /// </remarks>
-    /// <example>
-    /// <code>
-    /// var diff = ProtodefDiff.DiffTypes([
-    ///     new TypeFinderResult(735, packet735),
-    ///     new TypeFinderResult(736), // removed in this version
-    ///     new TypeFinderResult(737, packet737)
-    /// ]);
-    /// </code>
-    /// </example>
-    public static ProtodefDiffNode DiffTypes(IReadOnlyList<TypeFinderResult> inputs)
-    {
-        ArgumentNullException.ThrowIfNull(inputs);
-        if (inputs.Count == 0)
-            throw new ArgumentException("At least one input is required", nameof(inputs));
-
-        var ordered = inputs.OrderBy(x => x.Version).ToArray();
-        var versions = ordered.Select(x => x.Version).ToArray();
-        var structures = ordered.Select(x => x.Structure).ToArray();
-
-        var root = new ProtodefDiffNode(null, versions, structures);
-        BuildRecursive(root);
-        return root;
-    }
-
-    /// <summary>
-    /// Serializes a diff node and its children to a JSON string.
-    /// </summary>
-    /// <param name="root">Root node returned from <see cref="DiffTypes"/>.</param>
-    /// <param name="diffOptions">Controls whether compact history ranges and/or raw version arrays are emitted.</param>
-    /// <param name="options">Optional JSON options; defaults to <see cref="DefaultJsonOptions"/>.</param>
-    /// <returns>A JSON representation of the diff tree.</returns>
+    /// <param name="oldSchema">Previous schema node (may be <c>null</c>).</param>
+    /// <param name="newSchema">New schema node (may be <c>null</c>).</param>
+    /// <param name="path">Logical location of the compared node (root by default).</param>
+    /// <returns>Protocol-aware change descriptions.</returns>
     /// <remarks>
     /// <para>
-    /// By default the output favors compact <c>history</c> entries that collapse identical structures into contiguous
-    /// version ranges and emit <c>delta</c> objects for supported types (e.g., mapper key additions/removals). Raw
-    /// <c>versions</c> and <c>structures</c> arrays can be included by setting <see cref="ProtodefDiffJsonOptions.IncludeVersionArrays"/>.
+    /// Containers are compared positionally (field order is significant), switch and mapper
+    /// children are compared by key, and unchanged keys or fields are omitted from the result.
     /// </para>
-    /// <para>Example: serializing a mapper that adds the <c>ui</c> key only for versions 771-772:</para>
+    /// <para>Example: detecting the single mapper key added for the <c>SoundSource</c> type.</para>
     /// <code>
-    /// var sound = ProtodefDiff.DiffTypes([
-    ///     new TypeFinderResult(761, mapper9Keys),
-    ///     new TypeFinderResult(770, mapper9Keys),
-    ///     new TypeFinderResult(771, mapper10Keys)
-    /// ]);
-    /// var json = ProtodefDiff.ToJson(sound);
-    /// // Produces a history array with two ranges and a delta listing the newly added mapping.
+    /// var before = new ProtodefMapper(varint, new()
+    /// {
+    ///     ["0"] = "master", ["1"] = "music", ["2"] = "record", ["3"] = "weather",
+    ///     ["4"] = "block", ["5"] = "hostile", ["6"] = "neutral", ["7"] = "player",
+    ///     ["8"] = "ambient", ["9"] = "voice"
+    /// });
+    /// var after = new ProtodefMapper(varint, new(before.Mappings)
+    /// {
+    ///     ["10"] = "ui"
+    /// });
+    /// var changes = ProtodefDiff.Diff(before, after, "SoundSource");
+    /// // changes contains exactly one MapperKeyAdded entry for key "10".
     /// </code>
     /// </remarks>
-    public static string ToJson(
-        ProtodefDiffNode root,
-        ProtodefDiffJsonOptions? diffOptions = null,
-        JsonSerializerOptions? options = null)
+    public static IReadOnlyList<ProtodefChange> Diff(ProtodefType? oldSchema, ProtodefType? newSchema, string? path = null)
     {
-        using var stream = new MemoryStream();
-        using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = options?.WriteIndented ?? true });
-        WriteJson(root, writer, diffOptions, options);
-        writer.Flush();
-        return Encoding.UTF8.GetString(stream.ToArray());
+        var changes = new List<ProtodefChange>();
+        DiffInternal(oldSchema, newSchema, path ?? string.Empty, changes);
+        return changes;
     }
 
-    /// <summary>
-    /// Writes a diff node and its children to an existing JSON writer.
-    /// </summary>
-    /// <param name="root">Root node returned from <see cref="DiffTypes"/>.</param>
-    /// <param name="writer">Destination writer.</param>
-    /// <param name="options">Optional JSON options; defaults to <see cref="DefaultJsonOptions"/>.</param>
-    public static void WriteJson(
-        ProtodefDiffNode root,
-        Utf8JsonWriter writer,
-        ProtodefDiffJsonOptions? diffOptions = null,
-        JsonSerializerOptions? options = null)
+    private static void DiffInternal(ProtodefType? oldType, ProtodefType? newType, string path, List<ProtodefChange> changes)
     {
-        ArgumentNullException.ThrowIfNull(root);
-        ArgumentNullException.ThrowIfNull(writer);
-
-        var serializerOptions = options ?? DefaultJsonOptions;
-        var diff = diffOptions ?? DefaultDiffJsonOptions;
-        WriteNode(root, writer, serializerOptions, diff);
-    }
-
-    private static void BuildRecursive(ProtodefDiffNode node)
-    {
-        foreach (var child in ProtodefSemanticChildrenBuilder.Build(node.Versions, node.Structures))
+        if (oldType is null && newType is null)
         {
-            node.Children.Add(child);
-            BuildRecursive(child);
-        }
-    }
-
-    private static void WriteNode(
-        ProtodefDiffNode node,
-        Utf8JsonWriter writer,
-        JsonSerializerOptions options,
-        ProtodefDiffJsonOptions diffOptions)
-    {
-        writer.WriteStartObject();
-
-        if (node.Key is not null)
-            writer.WriteString("key", node.Key);
-
-        if (diffOptions.IncludeVersionArrays)
-        {
-            writer.WritePropertyName("versions");
-            JsonSerializer.Serialize(writer, node.Versions, options);
-
-            writer.WritePropertyName("structures");
-            JsonSerializer.Serialize(writer, node.Structures, options);
-        }
-
-        if (diffOptions.IncludeHistory)
-        {
-            var history = HistorySegment.Create(node.Versions, node.Structures);
-            writer.WritePropertyName("history");
-            writer.WriteStartArray();
-
-            HistorySegment? previousNonNull = null;
-            foreach (var segment in history)
-            {
-                writer.WriteStartObject();
-
-                writer.WritePropertyName("range");
-                if (segment.Start == segment.End)
-                {
-                    writer.WriteNumberValue(segment.Start);
-                }
-                else
-                {
-                    writer.WriteStartArray();
-                    writer.WriteNumberValue(segment.Start);
-                    writer.WriteNumberValue(segment.End);
-                    writer.WriteEndArray();
-                }
-
-                writer.WritePropertyName("structure");
-                JsonSerializer.Serialize(writer, segment.Structure, options);
-
-                if (diffOptions.IncludeDeltas && previousNonNull?.Structure is { } prevStruct && segment.Structure is { } currentStruct)
-                {
-                    WriteDelta(prevStruct, currentStruct, writer, options);
-                }
-
-                writer.WriteEndObject();
-
-                if (segment.Structure is not null)
-                {
-                    previousNonNull = segment;
-                }
-            }
-
-            writer.WriteEndArray();
-        }
-
-        if (node.Children.Count > 0)
-        {
-            writer.WritePropertyName("children");
-            writer.WriteStartArray();
-
-            foreach (var child in node.Children)
-            {
-                WriteNode(child, writer, options, diffOptions);
-            }
-
-            writer.WriteEndArray();
-        }
-
-        writer.WriteEndObject();
-    }
-
-    private static void WriteDelta(ProtodefType previous, ProtodefType current, Utf8JsonWriter writer, JsonSerializerOptions options)
-    {
-        switch (previous, current)
-        {
-            case (ProtodefMapper prevMapper, ProtodefMapper currentMapper):
-                WriteMapperDelta(prevMapper, currentMapper, writer, options);
-                break;
-        }
-    }
-
-    private static void WriteMapperDelta(ProtodefMapper previous, ProtodefMapper current, Utf8JsonWriter writer, JsonSerializerOptions options)
-    {
-        var added = new Dictionary<string, string>();
-        var removed = new Dictionary<string, string>();
-
-        foreach (var kv in current.Mappings)
-        {
-            if (!previous.Mappings.TryGetValue(kv.Key, out var prevValue))
-            {
-                added[kv.Key] = kv.Value;
-            }
-            else if (!string.Equals(prevValue, kv.Value, StringComparison.Ordinal))
-            {
-                removed[kv.Key] = prevValue;
-                added[kv.Key] = kv.Value;
-            }
-        }
-
-        foreach (var kv in previous.Mappings)
-        {
-            if (!current.Mappings.ContainsKey(kv.Key))
-            {
-                removed[kv.Key] = kv.Value;
-            }
-        }
-
-        if (added.Count == 0 && removed.Count == 0)
             return;
-
-        writer.WritePropertyName("delta");
-        writer.WriteStartObject();
-
-        if (added.Count > 0)
-        {
-            writer.WritePropertyName("addedMappings");
-            JsonSerializer.Serialize(writer, added, options);
         }
 
-        if (removed.Count > 0)
+        if (oldType is null)
         {
-            writer.WritePropertyName("removedMappings");
-            JsonSerializer.Serialize(writer, removed, options);
+            changes.Add(new TypeAdded(path, newType!));
+            return;
         }
 
-        writer.WriteEndObject();
-    }
-}
-
-internal static class ProtodefSemanticChildrenBuilder
-{
-    public static IEnumerable<ProtodefDiffNode> Build(IReadOnlyList<int> versions, IReadOnlyList<ProtodefType?> structures)
-    {
-        var sample = structures.FirstOrDefault(static x => x is not null);
-        return sample switch
+        if (newType is null)
         {
-            ProtodefContainer => BuildContainerChildren(versions, structures),
-            ProtodefSwitch => BuildSwitchChildren(versions, structures),
-            ProtodefMapper => BuildMapperChildren(versions, structures),
-            ProtodefNamespace => BuildNamespaceChildren(versions, structures),
-            ProtodefProtocol => BuildProtocolChildren(versions, structures),
-            _ => Enumerable.Empty<ProtodefDiffNode>()
-        };
-    }
-
-    private static IEnumerable<ProtodefDiffNode> BuildProtocolChildren(IReadOnlyList<int> versions,
-        IReadOnlyList<ProtodefType?> structures)
-    {
-        var children = new Dictionary<string, ProtodefType?[]>(StringComparer.Ordinal);
-
-        for (int i = 0; i < structures.Count; i++)
-        {
-            if (structures[i] is not ProtodefProtocol protocol)
-                continue;
-
-            foreach (var kv in protocol.Children)
-            {
-                var array = GetOrCreateChildSlot(children, kv.Key!, structures.Count);
-                array[i] = kv.Value;
-            }
+            changes.Add(new TypeRemoved(path, oldType));
+            return;
         }
 
-        return BuildNodes(versions, children);
-    }
-
-    private static IEnumerable<ProtodefDiffNode> BuildNamespaceChildren(IReadOnlyList<int> versions,
-        IReadOnlyList<ProtodefType?> structures)
-    {
-        var children = new Dictionary<string, ProtodefType?[]>(StringComparer.Ordinal);
-
-        for (int i = 0; i < structures.Count; i++)
+        if (oldType.GetType() != newType.GetType())
         {
-            if (structures[i] is not ProtodefNamespace ns)
-                continue;
-
-            foreach (var kv in ns.Types)
-            {
-                var array = GetOrCreateChildSlot(children, kv.Key, structures.Count);
-                array[i] = kv.Value;
-            }
+            changes.Add(new TypeReplaced(path, oldType, newType));
+            return;
         }
 
-        return BuildNodes(versions, children);
-    }
-
-    private static IEnumerable<ProtodefDiffNode> BuildContainerChildren(IReadOnlyList<int> versions,
-        IReadOnlyList<ProtodefType?> structures)
-    {
-        var children = new Dictionary<string, ProtodefType?[]>(StringComparer.Ordinal);
-
-        for (int i = 0; i < structures.Count; i++)
+        switch (oldType)
         {
-            if (structures[i] is not ProtodefContainer container)
-                continue;
+            case ProtodefMapper oldMapper when newType is ProtodefMapper newMapper:
+                DiffMapper(path, oldMapper, newMapper, changes);
+                DiffInternal(oldMapper.Type, newMapper.Type, AppendPath(path, "type"), changes);
+                return;
 
-            foreach (var field in container.Fields)
-            {
-                var key = field.Name ?? string.Empty;
-                var array = GetOrCreateChildSlot(children, key, structures.Count);
-                array[i] = field.Type;
-            }
-        }
+            case ProtodefSwitch oldSwitch when newType is ProtodefSwitch newSwitch:
+                DiffSwitch(path, oldSwitch, newSwitch, changes);
+                return;
 
-        return BuildNodes(versions, children);
-    }
+            case ProtodefContainer oldContainer when newType is ProtodefContainer newContainer:
+                DiffContainer(path, oldContainer, newContainer, changes);
+                return;
 
-    private static IEnumerable<ProtodefDiffNode> BuildSwitchChildren(IReadOnlyList<int> versions,
-        IReadOnlyList<ProtodefType?> structures)
-    {
-        var children = new Dictionary<string, ProtodefType?[]>(StringComparer.Ordinal);
-
-        for (int i = 0; i < structures.Count; i++)
-        {
-            if (structures[i] is not ProtodefSwitch sw)
-                continue;
-
-            if (sw.Fields is not null)
-            {
-                foreach (var kv in sw.Fields)
+            default:
+                if (oldType != newType)
                 {
-                    var array = GetOrCreateChildSlot(children, kv.Key, structures.Count);
-                    array[i] = kv.Value;
+                    changes.Add(new TypeReplaced(path, oldType, newType));
+                }
+                return;
+        }
+    }
+
+    private static void DiffMapper(string path, ProtodefMapper oldMapper, ProtodefMapper newMapper, List<ProtodefChange> changes)
+    {
+        foreach (var kv in newMapper.Mappings)
+        {
+            if (!oldMapper.Mappings.TryGetValue(kv.Key, out var previous))
+            {
+                changes.Add(new MapperKeyAdded(AppendPath(path, "mappings"), kv.Key, kv.Value));
+            }
+            else if (!string.Equals(previous, kv.Value, StringComparison.Ordinal))
+            {
+                changes.Add(new MapperValueChanged(AppendPath(path, "mappings"), kv.Key, previous, kv.Value));
+            }
+        }
+
+        foreach (var kv in oldMapper.Mappings)
+        {
+            if (!newMapper.Mappings.ContainsKey(kv.Key))
+            {
+                changes.Add(new MapperKeyRemoved(AppendPath(path, "mappings"), kv.Key, kv.Value));
+            }
+        }
+    }
+
+    private static void DiffSwitch(string path, ProtodefSwitch oldSwitch, ProtodefSwitch newSwitch, List<ProtodefChange> changes)
+    {
+        if (!string.Equals(oldSwitch.CompareTo, newSwitch.CompareTo, StringComparison.Ordinal) ||
+            !string.Equals(oldSwitch.CompareToValue, newSwitch.CompareToValue, StringComparison.Ordinal))
+        {
+            changes.Add(new SwitchSelectorChanged(path, oldSwitch.CompareTo, newSwitch.CompareTo, oldSwitch.CompareToValue, newSwitch.CompareToValue));
+        }
+
+        var oldCases = oldSwitch.Fields ?? new Dictionary<string, ProtodefType>();
+        var newCases = newSwitch.Fields ?? new Dictionary<string, ProtodefType>();
+
+        foreach (var kv in newCases)
+        {
+            if (!oldCases.TryGetValue(kv.Key, out var oldCase))
+            {
+                changes.Add(new SwitchCaseAdded(AppendPath(path, $"case[{kv.Key}]"), kv.Key, kv.Value));
+                continue;
+            }
+
+            DiffInternal(oldCase, kv.Value, AppendPath(path, $"case[{kv.Key}]"), changes);
+        }
+
+        foreach (var kv in oldCases)
+        {
+            if (!newCases.ContainsKey(kv.Key))
+            {
+                changes.Add(new SwitchCaseRemoved(AppendPath(path, $"case[{kv.Key}]"), kv.Key, kv.Value));
+            }
+        }
+
+        if (oldSwitch.Default is null && newSwitch.Default is not null)
+        {
+            changes.Add(new SwitchDefaultAdded(AppendPath(path, "default"), newSwitch.Default));
+        }
+        else if (oldSwitch.Default is not null && newSwitch.Default is null)
+        {
+            changes.Add(new SwitchDefaultRemoved(AppendPath(path, "default"), oldSwitch.Default));
+        }
+        else if (oldSwitch.Default is not null && newSwitch.Default is not null)
+        {
+            DiffInternal(oldSwitch.Default, newSwitch.Default, AppendPath(path, "default"), changes);
+        }
+    }
+
+    private static void DiffContainer(string path, ProtodefContainer oldContainer, ProtodefContainer newContainer, List<ProtodefChange> changes)
+    {
+        var oldFields = oldContainer.Fields;
+        var newFields = newContainer.Fields;
+
+        var newByName = newFields
+            .Select((f, i) => new { Name = f.Name ?? string.Empty, Index = i })
+            .ToDictionary(x => x.Name, x => x.Index, StringComparer.Ordinal);
+
+        var oldByName = oldFields
+            .Select((f, i) => new { Name = f.Name ?? string.Empty, Index = i })
+            .ToDictionary(x => x.Name, x => x.Index, StringComparer.Ordinal);
+
+        var matchedNew = new bool[newFields.Count];
+
+        for (int i = 0; i < oldFields.Count; i++)
+        {
+            var oldField = oldFields[i];
+            var oldName = oldField.Name ?? string.Empty;
+
+            if (i < newFields.Count)
+            {
+                var newField = newFields[i];
+                var newName = newField.Name ?? string.Empty;
+
+                if (string.Equals(oldName, newName, StringComparison.Ordinal))
+                {
+                    matchedNew[i] = true;
+                    DiffInternal(oldField.Type, newField.Type, AppendPath(path, SegmentForField(newName, i)), changes);
+                    continue;
                 }
             }
 
-            if (sw.Default is not null)
+            if (newByName.TryGetValue(oldName, out var newIndex) && !matchedNew[newIndex])
             {
-                var array = GetOrCreateChildSlot(children, "default", structures.Count);
-                array[i] = sw.Default;
+                matchedNew[newIndex] = true;
+                changes.Add(new ContainerFieldReordered(path, oldName, i, newIndex));
+                DiffInternal(oldField.Type, newFields[newIndex].Type, AppendPath(path, SegmentForField(oldName, newIndex)), changes);
+                continue;
+            }
+
+            if (i < newFields.Count && !matchedNew[i])
+            {
+                var newField = newFields[i];
+                var newName = newField.Name ?? string.Empty;
+                if (!oldByName.ContainsKey(newName) && Equals(oldField.Type, newField.Type))
+                {
+                    matchedNew[i] = true;
+                    changes.Add(new ContainerFieldRenamed(path, i, oldName, newName));
+                    continue;
+                }
+            }
+
+            changes.Add(new ContainerFieldRemoved(path, i, oldName, oldField.Type));
+        }
+
+        for (int i = 0; i < newFields.Count; i++)
+        {
+            if (!matchedNew[i])
+            {
+                var field = newFields[i];
+                var name = field.Name ?? string.Empty;
+                changes.Add(new ContainerFieldAdded(path, i, name, field.Type));
             }
         }
-
-        return BuildNodes(versions, children);
     }
 
-    private static IEnumerable<ProtodefDiffNode> BuildMapperChildren(IReadOnlyList<int> versions,
-        IReadOnlyList<ProtodefType?> structures)
+    private static string AppendPath(string path, string segment)
     {
-        var children = new Dictionary<string, ProtodefType?[]>(StringComparer.Ordinal);
-
-        for (int i = 0; i < structures.Count; i++)
-        {
-            if (structures[i] is not ProtodefMapper mapper)
-                continue;
-
-            var array = GetOrCreateChildSlot(children, "type", structures.Count);
-            array[i] = mapper.Type;
-        }
-
-        return BuildNodes(versions, children);
+        return string.IsNullOrEmpty(path) ? segment : $"{path}.{segment}";
     }
 
-    private static ProtodefType?[] GetOrCreateChildSlot(Dictionary<string, ProtodefType?[]> children, string key, int size)
+    private static string SegmentForField(string name, int index)
     {
-        if (!children.TryGetValue(key, out var array))
-        {
-            array = new ProtodefType?[size];
-            children.Add(key, array);
-        }
-
-        return array;
-    }
-
-    private static IEnumerable<ProtodefDiffNode> BuildNodes(IReadOnlyList<int> versions,
-        Dictionary<string, ProtodefType?[]> children)
-    {
-        foreach (var kv in children.OrderBy(static x => x.Key, StringComparer.Ordinal))
-        {
-            yield return new ProtodefDiffNode(kv.Key, versions, kv.Value);
-        }
+        return string.IsNullOrEmpty(name) ? $"field[{index}]" : name;
     }
 }
 
 /// <summary>
-/// Represents a node in the semantic difference tree for protodef structures.
+/// Base record for semantic protodef changes.
 /// </summary>
-public sealed class ProtodefDiffNode
-{
-    public ProtodefDiffNode(string? key, IReadOnlyList<int> versions, IReadOnlyList<ProtodefType?> structures)
-    {
-        Key = key;
-        Versions = versions ?? throw new ArgumentNullException(nameof(versions));
-        Structures = structures ?? throw new ArgumentNullException(nameof(structures));
-        if (Versions.Count != Structures.Count)
-            throw new ArgumentException("Versions and structures collections must have the same length.");
-    }
+/// <param name="Path">Logical path to the changed node.</param>
+public abstract record ProtodefChange(string Path);
 
-    /// <summary>Child nodes aligned by <see cref="Versions"/>.</summary>
-    public List<ProtodefDiffNode> Children { get; } = new();
+public sealed record TypeAdded(string Path, ProtodefType NewType) : ProtodefChange(Path);
+public sealed record TypeRemoved(string Path, ProtodefType OldType) : ProtodefChange(Path);
+public sealed record TypeReplaced(string Path, ProtodefType OldType, ProtodefType NewType) : ProtodefChange(Path);
 
-    /// <summary>The logical name of this node (e.g. field name or case label).</summary>
-    public string? Key { get; }
+public sealed record MapperKeyAdded(string Path, string Key, string Value) : ProtodefChange(Path);
+public sealed record MapperKeyRemoved(string Path, string Key, string Value) : ProtodefChange(Path);
+public sealed record MapperValueChanged(string Path, string Key, string OldValue, string NewValue) : ProtodefChange(Path);
 
-    /// <summary>Version values passed to the diff.</summary>
-    public IReadOnlyList<int> Versions { get; }
+public sealed record SwitchSelectorChanged(string Path, string OldCompareTo, string NewCompareTo, string? OldValue, string? NewValue)
+    : ProtodefChange(Path);
+public sealed record SwitchCaseAdded(string Path, string CaseKey, ProtodefType CaseType) : ProtodefChange(Path);
+public sealed record SwitchCaseRemoved(string Path, string CaseKey, ProtodefType CaseType) : ProtodefChange(Path);
+public sealed record SwitchDefaultAdded(string Path, ProtodefType CaseType) : ProtodefChange(Path);
+public sealed record SwitchDefaultRemoved(string Path, ProtodefType CaseType) : ProtodefChange(Path);
 
-    /// <summary>Structures corresponding to each <see cref="Versions"/> entry.</summary>
-    public IReadOnlyList<ProtodefType?> Structures { get; }
-}
-
-/// <summary>
-/// Options to control how <see cref="ProtodefDiffNode"/> trees are serialized to JSON.
-/// </summary>
-public sealed class ProtodefDiffJsonOptions
-{
-    /// <summary>
-    /// Includes raw <c>versions</c> and <c>structures</c> arrays in the output.
-    /// </summary>
-    /// <remarks>Defaults to <c>false</c> to favor compact history entries.</remarks>
-    public bool IncludeVersionArrays { get; init; }
-
-    /// <summary>
-    /// Emits a compact <c>history</c> array that groups identical structures by contiguous version ranges.
-    /// </summary>
-    public bool IncludeHistory { get; init; } = true;
-
-    /// <summary>
-    /// When <see cref="IncludeHistory"/> is enabled, emit per-segment deltas when the structure type supports them
-    /// (e.g., added/removed mapper keys).
-    /// </summary>
-    public bool IncludeDeltas { get; init; } = true;
-}
-
-internal readonly record struct HistorySegment(int Start, int End, ProtodefType? Structure)
-{
-    public static IReadOnlyList<HistorySegment> Create(IReadOnlyList<int> versions, IReadOnlyList<ProtodefType?> structures)
-    {
-        var segments = new List<HistorySegment>();
-
-        int start = 0;
-        for (int i = 1; i <= structures.Count; i++)
-        {
-            var previous = structures[start];
-            var current = i < structures.Count ? structures[i] : null;
-
-            var isSame = i < structures.Count && previous == current;
-            if (isSame)
-                continue;
-
-            segments.Add(new HistorySegment(versions[start], versions[i - 1], previous));
-            start = i;
-        }
-
-        return segments;
-    }
-}
+public sealed record ContainerFieldAdded(string Path, int Index, string Name, ProtodefType FieldType) : ProtodefChange(Path);
+public sealed record ContainerFieldRemoved(string Path, int Index, string Name, ProtodefType FieldType) : ProtodefChange(Path);
+public sealed record ContainerFieldRenamed(string Path, int Index, string OldName, string NewName) : ProtodefChange(Path);
+public sealed record ContainerFieldReordered(string Path, string Name, int OldIndex, int NewIndex) : ProtodefChange(Path);
