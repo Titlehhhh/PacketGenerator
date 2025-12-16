@@ -1,3 +1,4 @@
+using System.Linq;
 using Protodef;
 
 namespace PacketGenerator;
@@ -38,6 +39,24 @@ public readonly record struct VersionRange(int StartVersion, int EndVersion)
     /// Returns a human readable description of the range for switch expressions.
     /// </summary>
     public string CondSw => IsOne ? StartVersion.ToString() : $">= {StartVersion} and <= {EndVersion}";
+}
+
+/// <summary>
+/// Represents a continuous protocol interval when comparing schemas.
+/// </summary>
+public readonly record struct ProtocolRange(int StartVersion, int EndVersion)
+{
+    public ProtocolRange(VersionRange range) : this(range.StartVersion, range.EndVersion)
+    {
+    }
+
+    public static ProtocolRange Create(int version) => new(version, version);
+
+    public bool Contains(int version) => version >= StartVersion && version <= EndVersion;
+
+    public int[] ToArray() => Enumerable.Range(StartVersion, EndVersion - StartVersion + 1).ToArray();
+
+    public override string ToString() => StartVersion == EndVersion ? $"{StartVersion}" : $"{StartVersion}-{EndVersion}";
 }
 
 /// <summary>

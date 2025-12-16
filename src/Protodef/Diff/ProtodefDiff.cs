@@ -1,24 +1,28 @@
+using System.Collections.Immutable;
+using System.Linq;
+using PacketGenerator;
 using Protodef.Enumerable;
 
 namespace Protodef;
 
 /// <summary>
-/// Computes semantic diffs between two protodef AST nodes using protocol-aware rules
+/// Computes semantic comparison trees between protodef AST nodes using protocol-aware rules
 /// instead of structural JSON comparisons.
 /// </summary>
 public static class ProtodefDiff
 {
     /// <summary>
-    /// Builds a list of semantic changes between two versions of the same protodef structure.
+    /// Compares two protodef structures and produces a recursive tree that mirrors the AST.
     /// </summary>
     /// <param name="oldSchema">Previous schema node (may be <c>null</c>).</param>
     /// <param name="newSchema">New schema node (may be <c>null</c>).</param>
     /// <param name="path">Logical location of the compared node (root by default).</param>
-    /// <returns>Protocol-aware change descriptions.</returns>
+    /// <returns>A root diff node that preserves structure even when nodes are unchanged.</returns>
     /// <remarks>
     /// <para>
     /// Containers are compared positionally (field order is significant), switch and mapper
-    /// children are compared by key, and unchanged keys or fields are omitted from the result.
+    /// children are compared by key, and unchanged keys or fields are still emitted as
+    /// <see cref="ProtodefDiffStatus.Same"/> nodes so the hierarchy remains intact.
     /// </para>
     /// <para>Example: detecting the single mapper key added for the <c>SoundSource</c> type.</para>
     /// <code>
@@ -32,90 +36,157 @@ public static class ProtodefDiff
     /// {
     ///     ["10"] = "ui"
     /// });
-    /// var changes = ProtodefDiff.Diff(before, after, "SoundSource");
-    /// // changes contains exactly one MapperKeyAdded entry for key "10".
+    /// var diff = ProtodefDiff.Diff(before, after, "SoundSource");
+    /// // diff.Children contains one child for mappings, whose children have a single Added node for key "10".
     /// </code>
     /// </remarks>
-    public static IReadOnlyList<ProtodefChange> Diff(ProtodefType? oldSchema, ProtodefType? newSchema, string? path = null)
+    public static ProtodefDiffNode? Diff(ProtodefType? oldSchema, ProtodefType? newSchema, string? path = null)
     {
-        var changes = new List<ProtodefChange>();
-        DiffInternal(oldSchema, newSchema, path ?? string.Empty, changes);
-        return changes;
+        return DiffInternal(oldSchema, newSchema, path ?? string.Empty);
     }
 
-    private static void DiffInternal(ProtodefType? oldType, ProtodefType? newType, string path, List<ProtodefChange> changes)
+    /// <summary>
+    /// Builds pairwise diff trees for each adjacent protocol range snapshot.
+    /// </summary>
+    public static IReadOnlyList<ProtodefRangeDiff> DiffRanges(IReadOnlyList<(ProtocolRange Range, ProtodefType? Schema)> history)
+    {
+        if (history is null) throw new ArgumentNullException(nameof(history));
+
+        var ordered = history.OrderBy(h => h.Range.StartVersion).ToList();
+        var results = new List<ProtodefRangeDiff>();
+
+        for (var i = 1; i < ordered.Count; i++)
+        {
+            var previous = ordered[i - 1];
+            var current = ordered[i];
+            var root = Diff(previous.Schema, current.Schema, string.Empty);
+            results.Add(new ProtodefRangeDiff(previous.Range, current.Range, root));
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Flattens a diff tree into a list of semantic changes by walking every node.
+    /// </summary>
+    public static IReadOnlyList<ProtodefChange> CollectChanges(ProtodefDiffNode? root)
+    {
+        if (root is null)
+        {
+            return Array.Empty<ProtodefChange>();
+        }
+
+        var buffer = new List<ProtodefChange>();
+        Traverse(root, buffer);
+        return buffer;
+    }
+
+    private static void Traverse(ProtodefDiffNode node, List<ProtodefChange> buffer)
+    {
+        buffer.AddRange(node.Changes);
+        foreach (var child in node.Children)
+        {
+            Traverse(child, buffer);
+        }
+    }
+
+    private static ProtodefDiffNode? DiffInternal(ProtodefType? oldType, ProtodefType? newType, string path)
     {
         if (oldType is null && newType is null)
         {
-            return;
+            return null;
         }
 
         if (oldType is null)
         {
-            changes.Add(new TypeAdded(path, newType!));
-            return;
+            var change = new TypeAdded(path, newType!);
+            return new ProtodefDiffNode(path, ProtodefDiffStatus.Added, null, newType, new[] { change }, Array.Empty<ProtodefDiffNode>());
         }
 
         if (newType is null)
         {
-            changes.Add(new TypeRemoved(path, oldType));
-            return;
+            var change = new TypeRemoved(path, oldType);
+            return new ProtodefDiffNode(path, ProtodefDiffStatus.Removed, oldType, null, new[] { change }, Array.Empty<ProtodefDiffNode>());
         }
 
         if (oldType.GetType() != newType.GetType())
         {
-            changes.Add(new TypeReplaced(path, oldType, newType));
-            return;
+            var change = new TypeReplaced(path, oldType, newType);
+            return new ProtodefDiffNode(path, ProtodefDiffStatus.Modified, oldType, newType, new[] { change }, Array.Empty<ProtodefDiffNode>());
         }
+
+        var children = new List<ProtodefDiffNode>();
+        var changes = new List<ProtodefChange>();
 
         switch (oldType)
         {
             case ProtodefMapper oldMapper when newType is ProtodefMapper newMapper:
-                DiffMapper(path, oldMapper, newMapper, changes);
-                DiffInternal(oldMapper.Type, newMapper.Type, AppendPath(path, "type"), changes);
-                return;
+                DiffMapper(path, oldMapper, newMapper, children, changes);
+                break;
 
             case ProtodefSwitch oldSwitch when newType is ProtodefSwitch newSwitch:
-                DiffSwitch(path, oldSwitch, newSwitch, changes);
-                return;
+                DiffSwitch(path, oldSwitch, newSwitch, children, changes);
+                break;
 
             case ProtodefContainer oldContainer when newType is ProtodefContainer newContainer:
-                DiffContainer(path, oldContainer, newContainer, changes);
-                return;
+                DiffContainer(path, oldContainer, newContainer, children, changes);
+                break;
 
             default:
-                if (oldType != newType)
+                if (!oldType.Equals(newType))
                 {
                     changes.Add(new TypeReplaced(path, oldType, newType));
                 }
-                return;
+                break;
         }
+
+        var status = DetermineStatus(oldType, newType, changes, children);
+        return new ProtodefDiffNode(path, status, oldType, newType, changes.ToImmutableArray(), children.ToImmutableArray());
     }
 
-    private static void DiffMapper(string path, ProtodefMapper oldMapper, ProtodefMapper newMapper, List<ProtodefChange> changes)
+    private static void DiffMapper(string path, ProtodefMapper oldMapper, ProtodefMapper newMapper, List<ProtodefDiffNode> children, List<ProtodefChange> changes)
     {
-        foreach (var kv in newMapper.Mappings)
+        var typeNode = DiffInternal(oldMapper.Type, newMapper.Type, AppendPath(path, "type"));
+        if (typeNode is not null)
         {
-            if (!oldMapper.Mappings.TryGetValue(kv.Key, out var previous))
-            {
-                changes.Add(new MapperKeyAdded(AppendPath(path, "mappings"), kv.Key, kv.Value));
-            }
-            else if (!string.Equals(previous, kv.Value, StringComparison.Ordinal))
-            {
-                changes.Add(new MapperValueChanged(AppendPath(path, "mappings"), kv.Key, previous, kv.Value));
-            }
+            children.Add(typeNode);
         }
 
-        foreach (var kv in oldMapper.Mappings)
+        var keys = new SortedSet<string>(oldMapper.Mappings.Keys, StringComparer.Ordinal);
+        keys.UnionWith(newMapper.Mappings.Keys);
+
+        foreach (var key in keys)
         {
-            if (!newMapper.Mappings.ContainsKey(kv.Key))
+            var childPath = AppendPath(path, $"mappings[{key}]");
+            var hasOld = oldMapper.Mappings.TryGetValue(key, out var oldValue);
+            var hasNew = newMapper.Mappings.TryGetValue(key, out var newValue);
+
+            if (hasOld && hasNew)
             {
-                changes.Add(new MapperKeyRemoved(AppendPath(path, "mappings"), kv.Key, kv.Value));
+                if (string.Equals(oldValue, newValue, StringComparison.Ordinal))
+                {
+                    children.Add(new ProtodefDiffNode(childPath, ProtodefDiffStatus.Same, null, null, Array.Empty<ProtodefChange>(), Array.Empty<ProtodefDiffNode>()));
+                }
+                else
+                {
+                    var change = new MapperValueChanged(childPath, key, oldValue!, newValue!);
+                    children.Add(new ProtodefDiffNode(childPath, ProtodefDiffStatus.Modified, null, null, new[] { change }, Array.Empty<ProtodefDiffNode>()));
+                }
+            }
+            else if (hasNew)
+            {
+                var change = new MapperKeyAdded(childPath, key, newValue!);
+                children.Add(new ProtodefDiffNode(childPath, ProtodefDiffStatus.Added, null, null, new[] { change }, Array.Empty<ProtodefDiffNode>()));
+            }
+            else if (hasOld)
+            {
+                var change = new MapperKeyRemoved(childPath, key, oldValue!);
+                children.Add(new ProtodefDiffNode(childPath, ProtodefDiffStatus.Removed, null, null, new[] { change }, Array.Empty<ProtodefDiffNode>()));
             }
         }
     }
 
-    private static void DiffSwitch(string path, ProtodefSwitch oldSwitch, ProtodefSwitch newSwitch, List<ProtodefChange> changes)
+    private static void DiffSwitch(string path, ProtodefSwitch oldSwitch, ProtodefSwitch newSwitch, List<ProtodefDiffNode> children, List<ProtodefChange> changes)
     {
         if (!string.Equals(oldSwitch.CompareTo, newSwitch.CompareTo, StringComparison.Ordinal) ||
             !string.Equals(oldSwitch.CompareToValue, newSwitch.CompareToValue, StringComparison.Ordinal))
@@ -126,40 +197,45 @@ public static class ProtodefDiff
         var oldCases = oldSwitch.Fields ?? new Dictionary<string, ProtodefType>();
         var newCases = newSwitch.Fields ?? new Dictionary<string, ProtodefType>();
 
-        foreach (var kv in newCases)
+        var keys = new SortedSet<string>(oldCases.Keys, StringComparer.Ordinal);
+        keys.UnionWith(newCases.Keys);
+
+        foreach (var key in keys)
         {
-            if (!oldCases.TryGetValue(kv.Key, out var oldCase))
+            var childPath = AppendPath(path, $"case[{key}]");
+            var hasOld = oldCases.TryGetValue(key, out var oldCase);
+            var hasNew = newCases.TryGetValue(key, out var newCase);
+
+            if (hasOld && hasNew)
             {
-                changes.Add(new SwitchCaseAdded(AppendPath(path, $"case[{kv.Key}]"), kv.Key, kv.Value));
-                continue;
+                var childNode = DiffInternal(oldCase, newCase, childPath) ??
+                                new ProtodefDiffNode(childPath, ProtodefDiffStatus.Same, oldCase, newCase, Array.Empty<ProtodefChange>(), Array.Empty<ProtodefDiffNode>());
+                children.Add(childNode);
             }
-
-            DiffInternal(oldCase, kv.Value, AppendPath(path, $"case[{kv.Key}]"), changes);
-        }
-
-        foreach (var kv in oldCases)
-        {
-            if (!newCases.ContainsKey(kv.Key))
+            else if (hasNew)
             {
-                changes.Add(new SwitchCaseRemoved(AppendPath(path, $"case[{kv.Key}]"), kv.Key, kv.Value));
+                var change = new SwitchCaseAdded(childPath, key, newCase!);
+                children.Add(new ProtodefDiffNode(childPath, ProtodefDiffStatus.Added, null, newCase, new[] { change }, Array.Empty<ProtodefDiffNode>()));
+            }
+            else if (hasOld)
+            {
+                var change = new SwitchCaseRemoved(childPath, key, oldCase!);
+                children.Add(new ProtodefDiffNode(childPath, ProtodefDiffStatus.Removed, oldCase, null, new[] { change }, Array.Empty<ProtodefDiffNode>()));
             }
         }
 
-        if (oldSwitch.Default is null && newSwitch.Default is not null)
+        var defaultPath = AppendPath(path, "default");
+        if (oldSwitch.Default is not null || newSwitch.Default is not null)
         {
-            changes.Add(new SwitchDefaultAdded(AppendPath(path, "default"), newSwitch.Default));
-        }
-        else if (oldSwitch.Default is not null && newSwitch.Default is null)
-        {
-            changes.Add(new SwitchDefaultRemoved(AppendPath(path, "default"), oldSwitch.Default));
-        }
-        else if (oldSwitch.Default is not null && newSwitch.Default is not null)
-        {
-            DiffInternal(oldSwitch.Default, newSwitch.Default, AppendPath(path, "default"), changes);
+            var defaultNode = DiffInternal(oldSwitch.Default, newSwitch.Default, defaultPath);
+            if (defaultNode is not null)
+            {
+                children.Add(defaultNode);
+            }
         }
     }
 
-    private static void DiffContainer(string path, ProtodefContainer oldContainer, ProtodefContainer newContainer, List<ProtodefChange> changes)
+    private static void DiffContainer(string path, ProtodefContainer oldContainer, ProtodefContainer newContainer, List<ProtodefDiffNode> children, List<ProtodefChange> changes)
     {
         var oldFields = oldContainer.Fields;
         var newFields = newContainer.Fields;
@@ -187,7 +263,9 @@ public static class ProtodefDiff
                 if (string.Equals(oldName, newName, StringComparison.Ordinal))
                 {
                     matchedNew[i] = true;
-                    DiffInternal(oldField.Type, newField.Type, AppendPath(path, SegmentForField(newName, i)), changes);
+                    var childNode = DiffInternal(oldField.Type, newField.Type, AppendPath(path, SegmentForField(newName, i))) ??
+                                    new ProtodefDiffNode(AppendPath(path, SegmentForField(newName, i)), ProtodefDiffStatus.Same, oldField.Type, newField.Type, Array.Empty<ProtodefChange>(), Array.Empty<ProtodefDiffNode>());
+                    children.Add(childNode);
                     continue;
                 }
             }
@@ -195,8 +273,12 @@ public static class ProtodefDiff
             if (newByName.TryGetValue(oldName, out var newIndex) && !matchedNew[newIndex])
             {
                 matchedNew[newIndex] = true;
-                changes.Add(new ContainerFieldReordered(path, oldName, i, newIndex));
-                DiffInternal(oldField.Type, newFields[newIndex].Type, AppendPath(path, SegmentForField(oldName, newIndex)), changes);
+                var childPath = AppendPath(path, SegmentForField(oldName, newIndex));
+                var reorderChange = new ContainerFieldReordered(path, oldName, i, newIndex);
+                var childNode = DiffInternal(oldField.Type, newFields[newIndex].Type, childPath) ??
+                                new ProtodefDiffNode(childPath, ProtodefDiffStatus.Same, oldField.Type, newFields[newIndex].Type, Array.Empty<ProtodefChange>(), Array.Empty<ProtodefDiffNode>());
+                var withChange = childNode with { Status = ProtodefDiffStatus.Modified, Changes = childNode.Changes.Concat(new[] { reorderChange }).ToImmutableArray() };
+                children.Add(withChange);
                 continue;
             }
 
@@ -207,12 +289,14 @@ public static class ProtodefDiff
                 if (!oldByName.ContainsKey(newName) && Equals(oldField.Type, newField.Type))
                 {
                     matchedNew[i] = true;
-                    changes.Add(new ContainerFieldRenamed(path, i, oldName, newName));
+                    var renameChange = new ContainerFieldRenamed(path, i, oldName, newName);
+                    children.Add(new ProtodefDiffNode(AppendPath(path, SegmentForField(newName, i)), ProtodefDiffStatus.Modified, oldField.Type, newField.Type, new[] { renameChange }, Array.Empty<ProtodefDiffNode>()));
                     continue;
                 }
             }
 
-            changes.Add(new ContainerFieldRemoved(path, i, oldName, oldField.Type));
+            var removedChange = new ContainerFieldRemoved(path, i, oldName, oldField.Type);
+            children.Add(new ProtodefDiffNode(AppendPath(path, SegmentForField(oldName, i)), ProtodefDiffStatus.Removed, oldField.Type, null, new[] { removedChange }, Array.Empty<ProtodefDiffNode>()));
         }
 
         for (int i = 0; i < newFields.Count; i++)
@@ -221,9 +305,20 @@ public static class ProtodefDiff
             {
                 var field = newFields[i];
                 var name = field.Name ?? string.Empty;
-                changes.Add(new ContainerFieldAdded(path, i, name, field.Type));
+                var addedChange = new ContainerFieldAdded(path, i, name, field.Type);
+                children.Add(new ProtodefDiffNode(AppendPath(path, SegmentForField(name, i)), ProtodefDiffStatus.Added, null, field.Type, new[] { addedChange }, Array.Empty<ProtodefDiffNode>()));
             }
         }
+    }
+
+    private static ProtodefDiffStatus DetermineStatus(ProtodefType oldType, ProtodefType newType, IReadOnlyCollection<ProtodefChange> changes, IReadOnlyCollection<ProtodefDiffNode> children)
+    {
+        if (changes.Count == 0 && children.All(c => c.Status == ProtodefDiffStatus.Same))
+        {
+            return oldType.Equals(newType) ? ProtodefDiffStatus.Same : ProtodefDiffStatus.Modified;
+        }
+
+        return ProtodefDiffStatus.Modified;
     }
 
     private static string AppendPath(string path, string segment)
@@ -236,6 +331,42 @@ public static class ProtodefDiff
         return string.IsNullOrEmpty(name) ? $"field[{index}]" : name;
     }
 }
+
+/// <summary>
+/// Describes the comparison result for a single protodef node.
+/// </summary>
+/// <param name="Path">Logical path of the node.</param>
+/// <param name="Status">Semantic relationship between old and new versions.</param>
+/// <param name="OldType">Previous AST node.</param>
+/// <param name="NewType">Current AST node.</param>
+/// <param name="Changes">Semantic changes attached to this node.</param>
+/// <param name="Children">Children that mirror the AST structure.</param>
+public sealed record ProtodefDiffNode(
+    string Path,
+    ProtodefDiffStatus Status,
+    ProtodefType? OldType,
+    ProtodefType? NewType,
+    IReadOnlyList<ProtodefChange> Changes,
+    IReadOnlyList<ProtodefDiffNode> Children);
+
+/// <summary>
+/// Indicates how a protodef node relates between two snapshots.
+/// </summary>
+public enum ProtodefDiffStatus
+{
+    Same,
+    Added,
+    Removed,
+    Modified
+}
+
+/// <summary>
+/// Represents a pairwise diff between adjacent protocol ranges.
+/// </summary>
+/// <param name="From">Earlier protocol interval.</param>
+/// <param name="To">Later protocol interval.</param>
+/// <param name="Root">Root diff node describing the transition.</param>
+public sealed record ProtodefRangeDiff(ProtocolRange From, ProtocolRange To, ProtodefDiffNode? Root);
 
 /// <summary>
 /// Base record for semantic protodef changes.
